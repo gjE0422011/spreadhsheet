@@ -60,16 +60,6 @@ function createDependencyGraph() {
             }
             forwardEdges.delete(cell)
         }
-        const dependents = reverseEdges.get(cell)
-        if (dependents) {
-            for (const dependent of dependents) {
-                if (forwardEdges.has(dependent)) {
-                    forwardEdges.get(dependent).delete(cell)
-                    if (forwardEdges.get(dependent).size === 0) forwardEdges.delete(dependent)
-                }
-            }
-            reverseEdges.delete(cell)
-        }
     }
 
     function getDependencies(cell) {
@@ -200,12 +190,13 @@ function tokenize(expression) {
             continue
         }
 
-        if ((char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z')) {
+        if (char === '$' || (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z')) {
             let identifier = ''
-            while (position < expression.length && ((expression[position] >= 'A' && expression[position] <= 'Z') || (expression[position] >= 'a' && expression[position] <= 'z') || (expression[position] >= '0' && expression[position] <= '9'))) {
+            while (position < expression.length && ((expression[position] >= 'A' && expression[position] <= 'Z') || (expression[position] >= 'a' && expression[position] <= 'z') || (expression[position] >= '0' && expression[position] <= '9') || expression[position] === '$')) {
                 identifier += expression[position].toUpperCase()
                 position++
             }
+            identifier = identifier.replace(/\$/g, '')
             if (position < expression.length && expression[position] === ':') {
                 tokens.push({ type: 'cell', value: identifier })
             } else {
@@ -801,6 +792,22 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         recalculate()
     }
 
+    // One undo entry for a complete fill/clear operation.
+    function executeSetCells(changes) {
+        const edits = []
+        for (const { row, col, value } of changes) {
+            if (row < 0 || col < 0 || row >= rows || col >= cols) continue
+            const newVal = String(value ?? '')
+            const oldVal = getCellRaw(row, col).raw
+            if (oldVal !== newVal) edits.push({ row, col, oldVal, newVal })
+        }
+        if (!edits.length) return
+        pushToUndoStack({ type: 'bulk', edits })
+        for (const edit of edits) setCellRaw(edit.row, edit.col, edit.newVal)
+        _generation++
+        recalculate()
+    }
+
     function executeInsertRow(atIndex) {
         const snapshot = takeSnapshot()
         const previousRows = rows
@@ -844,6 +851,11 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             setCellRaw(entry.r, entry.c, entry.oldVal)
             _generation++
             recalculate()
+        } else if (entry.type === 'bulk') {
+            redoStack.push(entry)
+            for (const edit of entry.edits) setCellRaw(edit.row, edit.col, edit.oldVal)
+            _generation++
+            recalculate()
         } else {
             // For structural changes (row/col insert/delete), save current state to redo
             // and restore the snapshot from undo entry
@@ -872,6 +884,11 @@ export function createEngine(initialRows = 50, initialCols = 50) {
             const currentValue = getCellRaw(entry.r, entry.c).raw
             undoStack.push({ ...entry, oldVal: currentValue })
             setCellRaw(entry.r, entry.c, entry.newVal)
+            _generation++
+            recalculate()
+        } else if (entry.type === 'bulk') {
+            undoStack.push(entry)
+            for (const edit of entry.edits) setCellRaw(edit.row, edit.col, edit.newVal)
             _generation++
             recalculate()
         } else {
@@ -917,6 +934,7 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         get cols() { return cols },
         getCell: getCellForDisplay,
         setCell: executeSetCell,
+        setCells: executeSetCells,
         insertRow: executeInsertRow,
         deleteRow: executeDeleteRow,
         insertColumn: executeInsertColumn,
