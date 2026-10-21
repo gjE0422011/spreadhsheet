@@ -434,7 +434,7 @@ function shiftCellReferences(formula, rowShift, colShift, atIndex, isColumnOpera
     // Shift cell references in formulas when rows/columns are inserted or deleted
     // Note: This function modifies ALL cell references in the formula, including those
     // in ranges. The logic ensures references shift correctly based on the operation type.
-    return formula.replace(/([A-Z]+)(\d+)/g, (match, colLetter, rowStr) => {
+    return formula.replace(/(\$?)([A-Z]+)(\$?)(\d+)/g, (match, colAnchor, colLetter, rowAnchor, rowStr) => {
         const colIdx = columnLetterToIndex(colLetter)
         const rowIdx = parseInt(rowStr) - 1
         let newRow = rowIdx
@@ -451,19 +451,26 @@ function shiftCellReferences(formula, rowShift, colShift, atIndex, isColumnOpera
         // Preserve original reference if shifting would result in invalid coordinates
         // This prevents formulas from breaking when rows/cols are deleted at boundaries
         if (newRow < 0 || newCol < 0) return match
-        return indexToCellKey(newRow, newCol)
+        const shifted = indexToCellKey(newRow, newCol).match(/^([A-Z]+)(\d+)$/)
+        return `${colAnchor}${shifted[1]}${rowAnchor}${shifted[2]}`
     })
 }
 
 function extractCellReferences(formula) {
     const references = new Set()
-    // Extract cell references using regex
-    // Note: This regex matches cell references like A1, B2, AA10, etc.
-    // It does NOT extract individual cells from ranges (e.g., A1:A5 only extracts A1 and A5)
-    const regex = /([A-Z]+\d+)/g
-    let match
-    while ((match = regex.exec(formula)) !== null) {
-        references.add(match[1])
+    const rangePattern = /\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)/g
+    const withoutRanges = formula.replace(rangePattern, (match, a, ar, b, br) => {
+        const c1 = columnLetterToIndex(a), c2 = columnLetterToIndex(b)
+        const r1 = Number(ar) - 1, r2 = Number(br) - 1
+        for (let r = Math.min(r1, r2); r <= Math.max(r1, r2); r++) {
+            for (let c = Math.min(c1, c2); c <= Math.max(c1, c2); c++) {
+                references.add(indexToCellKey(r, c))
+            }
+        }
+        return ' '
+    })
+    for (const match of withoutRanges.matchAll(/\$?([A-Z]+)\$?(\d+)/g)) {
+        references.add(match[1] + match[2])
     }
     return references
 }
@@ -504,13 +511,9 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     }
 
     function updateDependencies(cell, rawFormula) {
-        // Extract all cell references from the formula
-        // Note: This includes references in ranges (e.g., A1:A5 includes A1, A2, A3, A4, A5)
-        // but the current implementation only tracks the range endpoints
         for (const ref of extractCellReferences(rawFormula)) {
             if (isValidCellKey(ref)) graph.addDependency(cell, ref)
         }
-        // TODO: Consider tracking individual cells within ranges for more granular dependency tracking
     }
 
     function markCellDirty(cell) {
@@ -933,6 +936,16 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         get rows() { return rows },
         get cols() { return cols },
         getCell: getCellForDisplay,
+        getLastNonEmptyRow: () => {
+            let last = 0
+            for (const [key, cell] of cells) {
+                if (cell && String(cell.raw ?? '').trim()) {
+                    const row = Number(key.match(/\d+$/)?.[0] ?? 1) - 1
+                    if (row > last) last = row
+                }
+            }
+            return last
+        },
         setCell: executeSetCell,
         setCells: executeSetCells,
         insertRow: executeInsertRow,
