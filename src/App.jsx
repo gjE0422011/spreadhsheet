@@ -5,6 +5,8 @@ import { loadSampleSmall, loadSampleLarge } from './fixtures/loadSample.js'
 
 const TOTAL_ROWS = 50
 const TOTAL_COLS = 50
+const VIRTUAL_ROW_HEIGHT = 32
+const VIRTUAL_OVERSCAN = 10
 
 // Shift relative formula references while preserving $-anchored references.
 function shiftFillFormula(raw, rowOffset, colOffset) {
@@ -42,6 +44,55 @@ function extendFillValue(seedValues, index) {
   return String(seedValues[index % seedValues.length] ?? '')
 }
 
+
+// Challenge 4: transparent, local natural-language query interpreter (no external AI API).
+function interpretSheetQuery(input, columns) {
+  const query = input.trim()
+  const lower = query.toLowerCase()
+  if (!query) return { error: 'Enter a spreadsheet question or command.' }
+  const columnMatch = lower.match(/\b(?:column|col)\s+([a-z]{1,3})\b/) || lower.match(/\b([a-z]{1,3})\s+column\b/)
+  let col = -1
+  if (columnMatch) {
+    col = [...columnMatch[1].toUpperCase()].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1
+  } else {
+    // Allow bare single-letter references for queries such as "sum B".
+    const match = lower.match(/\b(?:sum|total|average|avg|mean|minimum|min|maximum|max|count|sort|filter)\s+(?:of\s+)?([a-z])\b/)
+    if (match) col = match[1].toUpperCase().charCodeAt(0) - 65
+  }
+  if (/\b(reset|clear)\s+(?:the\s+)?(?:view|filters?|sorting)\b/.test(lower) || lower === 'show all rows') return { type: 'reset' }
+  if (/\b(hide empty|nonempty|non-empty)\b/.test(lower)) return { type: 'hideEmpty' }
+  if (col < 0 || col >= columns) return { error: 'Please specify a valid column, such as A, B, or C.' }
+  if (/\b(sort|order|rank)\b/.test(lower)) {
+    const desc = /\b(desc|descending|highest|largest|biggest|z\s*to\s*a|high to low|decreasing)\b/.test(lower)
+    return { type: 'sort', col, direction: desc ? 'desc' : 'asc' }
+  }
+  if (/\b(filter|find|show|contains?|search)\b/.test(lower)) {
+    const term = query.match(/\b(?:for|containing|contains|equals|equal to|matching|with|is)\s+["']?(.+?)["']?\s*$/i)
+    if (!term) return { error: 'Try: filter column A for Alice' }
+    return { type: 'filter', col, term: term[1].trim().replace(/^["']|["']$/g, '') }
+  }
+  const aggregate = /\b(average|avg|mean)\b/.test(lower) ? 'average'
+    : /\b(sum|total)\b/.test(lower) ? 'sum'
+    : /\b(count|how many)\b/.test(lower) ? 'count'
+    : /\b(minimum|min|smallest|lowest)\b/.test(lower) ? 'min'
+    : /\b(maximum|max|largest|highest)\b/.test(lower) ? 'max' : null
+  if (aggregate) return { type: 'aggregate', col, aggregate }
+  return { error: 'Supported: sum, average, count, min, max, sort, filter, hide empty, and reset view.' }
+}
+
+// Display formatting never changes the underlying numeric value or formula.
+function formatCellDisplay(value, format) {
+  if (!format || format === 'general') return value
+  const text = String(value ?? '')
+  if (!text.trim() || !Number.isFinite(Number(text))) return value
+  const number = Number(text)
+  if (format === 'integer') return number.toLocaleString('en-US', { maximumFractionDigits: 0 })
+  if (format === 'decimal') return number.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  if (format === 'currency') return number.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
+  if (format === 'percent') return number.toLocaleString('en-US', { style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 1 })
+  return value
+}
+
 export default function App() {
   // Engine instance is created once and reused across renders
   // Note: The engine maintains its own internal state, so React state is only used for UI updates
@@ -65,6 +116,12 @@ export default function App() {
   const [filterColumn, setFilterColumn] = useState(0)
   const [filterText, setFilterText] = useState('')
   const [hideEmpty, setHideEmpty] = useState(false)
+  const gridScrollRef = useRef(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportHeight, setViewportHeight] = useState(560)
+  const [queryText, setQueryText] = useState('')
+  const [queryResult, setQueryResult] = useState('Try "sum column B" or "filter column A for Alice".')
+
 
   const forceRerender = useCallback(() => setVersion(v => v + 1), [])
 
@@ -321,6 +378,35 @@ export default function App() {
     }
   }, [selectedCell, selectionEnd])
 
+  // Challenge 5: Apply formatting to every cell in the selected rectangle.
+  // Keep the existing style attributes while changing only the requested ones.
+  const applyRangeStyle = useCallback((updates) => {
+    if (!selectionBounds) return
+    setCellStyles(previous => {
+      const next = { ...previous }
+      for (let r = selectionBounds.minRow; r <= selectionBounds.maxRow; r++) {
+        for (let c = selectionBounds.minCol; c <= selectionBounds.maxCol; c++) {
+          const key = `${r},${c}`
+          next[key] = { ...previous[key], ...updates }
+        }
+      }
+      return next
+    })
+  }, [selectionBounds])
+
+  const clearRangeFormatting = useCallback(() => {
+    if (!selectionBounds) return
+    setCellStyles(previous => {
+      const next = { ...previous }
+      for (let r = selectionBounds.minRow; r <= selectionBounds.maxRow; r++) {
+        for (let c = selectionBounds.minCol; c <= selectionBounds.maxCol; c++) {
+          delete next[`${r},${c}`]
+        }
+      }
+      return next
+    })
+  }, [selectionBounds])
+
   const finishFill = useCallback(() => {
     const drag = fillDragRef.current
     fillDragRef.current = null
@@ -397,6 +483,79 @@ export default function App() {
     }
     return filtered
   }, [engine, version, sortColumn, sortDirection, filterColumn, filterText, hideEmpty])
+
+  // Challenge 3: Only mount rows intersecting the viewport plus overscan.
+  // Preserve their original engine row IDs so formulas and edits stay correct.
+  useEffect(() => {
+    const element = gridScrollRef.current
+    if (!element) return
+    const measure = () => setViewportHeight(element.clientHeight || 560)
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(measure)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    const element = gridScrollRef.current
+    if (element) element.scrollTop = 0
+    setScrollTop(0)
+  }, [sortColumn, sortDirection, filterColumn, filterText, hideEmpty])
+
+  const firstVisibleIndex = Math.min(
+    visibleRows.length,
+    Math.max(0, Math.floor(scrollTop / VIRTUAL_ROW_HEIGHT) - VIRTUAL_OVERSCAN)
+  )
+  const lastVisibleIndex = Math.min(
+    visibleRows.length,
+    Math.ceil((scrollTop + viewportHeight) / VIRTUAL_ROW_HEIGHT) + VIRTUAL_OVERSCAN
+  )
+  const renderedRows = visibleRows.slice(firstVisibleIndex, lastVisibleIndex)
+  const topSpacerHeight = firstVisibleIndex * VIRTUAL_ROW_HEIGHT
+  const bottomSpacerHeight = (visibleRows.length - lastVisibleIndex) * VIRTUAL_ROW_HEIGHT
+
+  const runSheetQuery = useCallback((event) => {
+    event.preventDefault()
+    const command = interpretSheetQuery(queryText, engine.cols)
+    if (command.error) { setQueryResult(command.error); return }
+    if (command.type === 'reset') {
+      setSortDirection('none'); setFilterText(''); setHideEmpty(false)
+      setQueryResult('View reset. All rows are visible in their original order.')
+      return
+    }
+    if (command.type === 'hideEmpty') {
+      setHideEmpty(true)
+      setQueryResult('Empty rows are now hidden. Use "reset view" to restore them.')
+      return
+    }
+    const label = (() => { let n = command.col + 1, out = ''; while (n) { n--; out = String.fromCharCode(65 + n % 26) + out; n = Math.floor(n / 26) } return out })()
+    if (command.type === 'sort') {
+      setSortColumn(command.col); setSortDirection(command.direction)
+      setQueryResult(`Sorted the display by column ${label} (${command.direction === 'asc' ? 'ascending' : 'descending'}). Cell positions are unchanged.`)
+      return
+    }
+    if (command.type === 'filter') {
+      setFilterColumn(command.col); setFilterText(command.term)
+      setQueryResult(`Showing rows where column ${label} contains "${command.term}".`)
+      return
+    }
+    if (command.type === 'aggregate') {
+      // Calculate against rows in the current view, ignoring blanks and nonnumeric values.
+      const cells = visibleRows.map(r => engine.getCell(r, command.col))
+      const nonblank = cells.map(c => String(c.error ?? c.computed ?? c.raw ?? '').trim()).filter(Boolean)
+      const numeric = nonblank.map(Number).filter(Number.isFinite)
+      const values = numeric
+      let result
+      if (command.aggregate === 'count') result = nonblank.length
+      else if (!values.length) { setQueryResult(`No numeric values found in column ${label} within the current view.`); return }
+      else if (command.aggregate === 'sum') result = values.reduce((a,b) => a+b, 0)
+      else if (command.aggregate === 'average') result = values.reduce((a,b) => a+b, 0) / values.length
+      else if (command.aggregate === 'min') result = Math.min(...values)
+      else result = Math.max(...values)
+      setQueryResult(`${command.aggregate.toUpperCase()} of column ${label}: ${Number(result.toPrecision(12)).toLocaleString()} (${command.aggregate === 'count' ? nonblank.length + ' nonempty cells' : numeric.length + ' numeric cells'} in the current view).`)
+    }
+  }, [queryText, engine, visibleRows])
 
   const viewIsModified = sortDirection !== 'none' || filterText.trim() !== '' || hideEmpty
   const resetView = () => {
@@ -512,6 +671,32 @@ export default function App() {
           </div>
         </div>
 
+        {/* ── Challenge 5: range formatting and numeric display formats ── */}
+        <div aria-label="Range formatting" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, padding: '10px 12px', background: '#f8fafc', borderBottom: '1px solid #cbd5e1', fontSize: 13 }}>
+          <strong>Format Selection</strong>
+          <span style={{ color: '#64748b' }}>Select cells first; changes apply to the whole range.</span>
+          <label>Number format{' '}
+            <select aria-label="Number format" value={selectedCellStyle?.numberFormat || 'general'} disabled={!selectedCell} onChange={e => applyRangeStyle({ numberFormat: e.target.value })}>
+              <option value="general">General</option>
+              <option value="integer">Number (0 decimals)</option>
+              <option value="decimal">Number (2 decimals)</option>
+              <option value="currency">Currency (USD)</option>
+              <option value="percent">Percentage</option>
+            </select>
+          </label>
+          <label>Border{' '}
+            <select aria-label="Cell borders" value={selectedCellStyle?.border || 'none'} disabled={!selectedCell} onChange={e => applyRangeStyle({ border: e.target.value })}>
+              <option value="none">None</option>
+              <option value="all">All borders</option>
+              <option value="bottom">Bottom border</option>
+              <option value="top">Top border</option>
+            </select>
+          </label>
+          <button className="toolbar-btn" disabled={!selectedCell} onClick={() => applyRangeStyle({ bold: true })}>Bold range</button>
+          <button className="toolbar-btn" disabled={!selectedCell} onClick={() => applyRangeStyle({ bg: '#fff2b3' })}>Highlight range</button>
+          <button className="toolbar-btn" disabled={!selectedCell} onClick={clearRangeFormatting}>Clear formatting</button>
+        </div>
+
         {/* ── Challenge 2: Sort and filter (non-destructive view) ── */}
         <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10, padding: '10px 12px', background: '#f1f5f9', borderBottom: '1px solid #d1d5db', fontSize: 13 }}>
           <strong>Sort &amp; Filter</strong>
@@ -530,9 +715,22 @@ export default function App() {
           <input aria-label="Filter text" placeholder="Contains text…" value={filterText} onChange={e => setFilterText(e.target.value)} style={{ padding: '6px 8px', border: '1px solid #cbd5e1', borderRadius: 4, width: 145 }} />
           <label><input type="checkbox" checked={hideEmpty} onChange={e => setHideEmpty(e.target.checked)} /> Hide empty rows</label>
           <button className="toolbar-btn" onClick={resetView}>Reset view</button>
-          <span style={{ color: '#475569' }}>{visibleRows.length} of {engine.rows} rows</span>
+          <span style={{ color: '#475569' }}>{visibleRows.length} of {engine.rows} rows · {renderedRows.length} mounted</span>
           {viewIsModified && <span style={{ color: '#9a3412' }}>View only · Reset view to use fill handle</span>}
         </div>
+
+        {/* ── Challenge 4: local natural-language spreadsheet commands ── */}
+        <form onSubmit={runSheetQuery} aria-label="Spreadsheet natural language queries" style={{ padding: '12px', background: '#eff6ff', borderBottom: '1px solid #bfdbfe' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+            <strong>Ask the Sheet</strong>
+            <span style={{ color: '#475569', fontSize: 12 }}>Local command parser · no AI API required</span>
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <input aria-label="Ask the Sheet query" value={queryText} onChange={e => setQueryText(e.target.value)} placeholder="e.g. average column B, sort column C descending" style={{ flex: 1, minWidth: 0, padding: '8px 10px', border: '1px solid #93c5fd', borderRadius: 5 }} />
+            <button type="submit" className="toolbar-btn">Run query</button>
+          </div>
+          <div role="status" aria-live="polite" style={{ marginTop: 7, fontSize: 13, color: '#1e3a8a' }}>{queryResult}</div>
+        </form>
 
         {/* ── Formula Bar ── */}
         <div className="formula-bar">
@@ -548,7 +746,7 @@ export default function App() {
         </div>
 
         {/* ── Grid ── */}
-        <div className="grid-scroll" onMouseUp={() => { handleCellMouseUp(); finishFill() }} onMouseLeave={handleCellMouseUp}>
+        <div className="grid-scroll" ref={gridScrollRef} onScroll={e => setScrollTop(e.currentTarget.scrollTop)} onMouseUp={() => { handleCellMouseUp(); finishFill() }} onMouseLeave={handleCellMouseUp} style={{ height: 'min(62vh, 620px)', overflow: 'auto' }}>
           <table className="grid-table">
             <thead>
               <tr>
@@ -561,8 +759,13 @@ export default function App() {
               </tr>
             </thead>
             <tbody>
-              {visibleRows.map(rowIndex => (
-                <tr key={rowIndex}>
+              {topSpacerHeight > 0 && (
+                <tr aria-hidden="true" style={{ height: topSpacerHeight }}>
+                  <td colSpan={engine.cols + 1} style={{ height: topSpacerHeight, padding: 0, border: 0, background: 'transparent' }} />
+                </tr>
+              )}
+              {renderedRows.map(rowIndex => (
+                <tr key={rowIndex} style={{ height: VIRTUAL_ROW_HEIGHT }}>
                   <td className="row-header">{rowIndex + 1}</td>
                   {Array.from({ length: engine.cols }, (_, colIndex) => {
                     const isSelected = Boolean(selectionBounds &&
@@ -581,7 +784,7 @@ export default function App() {
                       <td
                         key={colIndex}
                         className={`cell ${isSelected ? 'selected' : ''} ${fillTarget && selectionBounds && colIndex >= selectionBounds.minCol && colIndex <= selectionBounds.maxCol && rowIndex > selectionBounds.maxRow && rowIndex <= fillTarget.r ? 'selected' : ''}`}
-                        style={{ background: style.bg || 'white', position: 'relative' }}
+                        style={{ background: style.bg || 'white', position: 'relative', boxShadow: style.border === 'all' ? 'inset 0 0 0 1px #64748b' : style.border === 'bottom' ? 'inset 0 -2px 0 #64748b' : style.border === 'top' ? 'inset 0 2px 0 #64748b' : undefined }}
                         onMouseDown={(e) => {
                           if (e.target.tagName === 'INPUT') return
                           e.preventDefault()
@@ -623,7 +826,7 @@ export default function App() {
                               fontSize: (style.fontSize || 13) + 'px',
                             }}
                           >
-                            {displayValue}
+                            {cellData.error ? displayValue : formatCellDisplay(displayValue, style.numberFormat)}
                           </div>
                         )}
                         {!viewIsModified && isSelected && selectionBounds && rowIndex === selectionBounds.maxRow && colIndex === selectionBounds.maxCol && !isEditing && (
@@ -643,6 +846,11 @@ export default function App() {
                   })}
                 </tr>
               ))}
+              {bottomSpacerHeight > 0 && (
+                <tr aria-hidden="true" style={{ height: bottomSpacerHeight }}>
+                  <td colSpan={engine.cols + 1} style={{ height: bottomSpacerHeight, padding: 0, border: 0, background: 'transparent' }} />
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
