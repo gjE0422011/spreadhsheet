@@ -274,17 +274,26 @@ function parseTokensToAST(tokens) {
             }
             position++
         } else if (token.type === 'range') {
-            if (outputQueue.length < 2) throw new Error('Invalid range syntax')
-            const endCell = outputQueue.pop()
-            const startCell = outputQueue.pop()
-            if (startCell.type !== 'cell' || endCell.type !== 'cell') {
-                throw new Error('Range must be between two cell references')
-            }
-            outputQueue.push({ type: 'range', start: startCell.value, end: endCell.value })
-            position++
-        } else {
-            position++
-        }
+    const startCell = outputQueue.pop()
+    const endCell = tokens[position + 1]
+
+    if (
+        !startCell ||
+        !endCell ||
+        startCell.type !== 'cell' ||
+        endCell.type !== 'cell'
+    ) {
+        throw new Error('Range must be between two cell references')
+    }
+
+    outputQueue.push({
+        type: 'range',
+        start: startCell.value,
+        end: endCell.value
+    })
+
+    position += 2
+}
     }
 
     while (operatorStack.length > 0) {
